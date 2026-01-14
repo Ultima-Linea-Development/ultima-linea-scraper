@@ -18,8 +18,6 @@ func main() {
 	}
 
 	// Flags de línea de comandos
-	startPage := flag.Int("start", 1, "Página inicial para scraping")
-	endPage := flag.Int("end", 5, "Página final para scraping")
 	withImages := flag.Bool("images", true, "Obtener imágenes de cada álbum")
 	outputFile := flag.String("output", "yupoo_products.json", "Archivo de salida JSON")
 	flag.Parse()
@@ -27,18 +25,18 @@ func main() {
 	// Banner
 	fmt.Println("╔════════════════════════════════════════════╗")
 	fmt.Println("║   Ultima Linea - Yupoo Scraper            ║")
-	fmt.Println("║   Scraping de productos de Yupoo          ║")
+	fmt.Println("║   Scraping de categorías de fútbol        ║")
 	fmt.Println("╚════════════════════════════════════════════╝")
 	fmt.Println()
 
 	// Crear scraper
 	yupooScraper := scraper.NewYupooScraper()
 
-	// Scraping de páginas
-	log.Printf("Configuración: Páginas %d-%d, Imágenes: %v\n", *startPage, *endPage, *withImages)
+	// Scraping de categorías de fútbol
+	log.Printf("Configuración: %d categorías, Imágenes: %v\n", len(scraper.FootballCategories), *withImages)
 	fmt.Println()
 
-	err := yupooScraper.ScrapeAllPages(*startPage, *endPage)
+	err := yupooScraper.ScrapeCategories(scraper.FootballCategories)
 	if err != nil {
 		log.Fatalf("Error durante el scraping: %v\n", err)
 	}

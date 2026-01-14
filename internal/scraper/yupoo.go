@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gocolly/colly/v2"
@@ -13,16 +14,43 @@ import (
 )
 
 const (
-	baseURL      = "https://huang-66.x.yupoo.com"
-	galleryURL   = baseURL + "/albums?tab=gallery"
-	maxPages     = 45 // Número total de páginas según el análisis
-	imagesPerAlbum = 3  // Solo las primeras 3 imágenes
+	baseURL           = "https://huang-66.x.yupoo.com"
+	imagesPerAlbum    = 3  // Solo las primeras 3 imágenes
+	albumsPerCategory = 15 // Solo los primeros 15 álbumes por categoría
 )
 
+// Category representa una categoría de productos
+type Category struct {
+	ID   string
+	Name string
+	URL  string
+}
+
+// FootballCategories son las categorías de fútbol a scrapear
+var FootballCategories = []Category{
+	{ID: "661649", Name: "Mundial 2026", URL: baseURL + "/categories/661649"},
+	{ID: "661476", Name: "La Liga España", URL: baseURL + "/categories/661476"},
+	{ID: "3925870", Name: "Liga Argentina", URL: baseURL + "/categories/3925870"},
+	{ID: "3258137", Name: "Retro Collection", URL: baseURL + "/categories/3258137"},
+	{ID: "3185811", Name: "Liga Chilena", URL: baseURL + "/categories/3185811"},
+	{ID: "3534092", Name: "Brasileirao", URL: baseURL + "/categories/3534092"},
+	{ID: "654538", Name: "Premier", URL: baseURL + "/categories/654538"},
+	{ID: "654560", Name: "Serie A", URL: baseURL + "/categories/654560"},
+	{ID: "661562", Name: "Ligue 1 Francia", URL: baseURL + "/categories/661562"},
+	{ID: "660913", Name: "Bundesliga", URL: baseURL + "/categories/660913"},
+	{ID: "4279143", Name: "Saudi League", URL: baseURL + "/categories/4279143"},
+	{ID: "3925867", Name: "MLS", URL: baseURL + "/categories/3925867"},
+	{ID: "3576323", Name: "World Jersey", URL: baseURL + "/categories/3576323"},
+	{ID: "3341199", Name: "Player Version", URL: baseURL + "/categories/3341199"},
+}
+
 type YupooScraper struct {
-	collector *colly.Collector
-	albums    []models.YupooAlbum
-	stats     models.ScraperStats
+	collector           *colly.Collector
+	albums              []models.YupooAlbum
+	stats               models.ScraperStats
+	currentCategory     string // Para trackear la categoría actual durante el scraping
+	albumsInCategory    int    // Contador de álbumes en la categoría actual
+	mu                  sync.Mutex // Para proteger acceso concurrente a albums
 }
 
 // NewYupooScraper crea una nueva instancia del scraper
@@ -35,8 +63,8 @@ func NewYupooScraper() *YupooScraper {
 	// Rate limiting para no saturar el servidor
 	c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
-		Parallelism: 5,        // Aumentado de 2 a 5 requests paralelos
-		Delay:       500 * time.Millisecond, // Reducido de 2s a 0.5s
+		Parallelism: 2,        // Reducido a 2 para evitar rate limiting
+		Delay:       2 * time.Second, // Aumentado a 2s para ser más respetuoso
 	})
 
 	return &YupooScraper{
@@ -48,39 +76,75 @@ func NewYupooScraper() *YupooScraper {
 	}
 }
 
-// ScrapeAllPages recorre todas las páginas de la galería
-func (s *YupooScraper) ScrapeAllPages(startPage, endPage int) error {
-	log.Printf("Iniciando scraping de páginas %d a %d...\n", startPage, endPage)
-
-	// Validar rango de páginas
-	if startPage < 1 || endPage > maxPages || startPage > endPage {
-		return fmt.Errorf("rango de páginas inválido: %d-%d (máximo: %d)", startPage, endPage, maxPages)
-	}
-
-	s.stats.TotalPages = endPage - startPage + 1
+// ScrapeCategories recorre todas las categorías de fútbol especificadas
+func (s *YupooScraper) ScrapeCategories(categories []Category) error {
+	log.Printf("Iniciando scraping de %d categorías de fútbol...\n", len(categories))
 
 	// Configurar el scraper para el listado de álbumes
 	s.setupAlbumListingCollector()
 
-	// Recorrer cada página
-	for page := startPage; page <= endPage; page++ {
-		url := fmt.Sprintf("%s&page=%d", galleryURL, page)
-		log.Printf("Scraping página %d/%d: %s\n", page, endPage, url)
+	// Recorrer cada categoría
+	for i, category := range categories {
+		log.Printf("\n[%d/%d] Scraping categoría: %s\n", i+1, len(categories), category.Name)
 
-		err := s.collector.Visit(url)
-		if err != nil {
-			log.Printf("Error al visitar página %d: %v\n", page, err)
-			s.stats.FailedScans++
+		// Establecer la categoría actual y resetear contador
+		s.currentCategory = category.Name
+		s.albumsInCategory = 0
+
+		// Cada categoría puede tener múltiples páginas
+		// Empezamos por la página 1 y vemos si hay más
+		pageNum := 1
+		hasMorePages := true
+
+		for hasMorePages {
+			var url string
+			if pageNum == 1 {
+				url = category.URL
+			} else {
+				url = fmt.Sprintf("%s?page=%d", category.URL, pageNum)
+			}
+
+			log.Printf("  Scraping página %d: %s\n", pageNum, url)
+
+			// Crear un collector temporal para esta categoría
+			tempAlbumsCount := len(s.albums)
+
+			err := s.collector.Visit(url)
+			if err != nil {
+				log.Printf("  Error al visitar página %d: %v\n", pageNum, err)
+				s.stats.FailedScans++
+				break
+			}
+
+			s.collector.Wait()
+
+			// Si no encontramos nuevos álbumes, asumimos que no hay más páginas
+			if len(s.albums) == tempAlbumsCount {
+				hasMorePages = false
+			} else {
+				pageNum++
+				s.stats.TotalPages++
+				// Limitar a 15 álbumes por categoría
+				if s.albumsInCategory >= albumsPerCategory {
+					log.Printf("  Alcanzado límite de %d álbumes para esta categoría\n", albumsPerCategory)
+					hasMorePages = false
+				}
+				// Limitar a un número razonable de páginas por categoría
+				if pageNum > 50 {
+					log.Printf("  Alcanzado límite de 50 páginas para esta categoría\n")
+					hasMorePages = false
+				}
+			}
 		}
-	}
 
-	s.collector.Wait()
+		log.Printf("  ✓ Categoría %s completada: %d álbumes en esta categoría\n", category.Name, s.albumsInCategory)
+	}
 
 	s.stats.EndTime = time.Now()
 	s.stats.Duration = s.stats.EndTime.Sub(s.stats.StartTime).String()
 	s.stats.TotalAlbums = len(s.albums)
 
-	log.Printf("Scraping completado: %d álbumes encontrados\n", s.stats.TotalAlbums)
+	log.Printf("\nScraping de categorías completado: %d álbumes encontrados en total\n", s.stats.TotalAlbums)
 
 	return nil
 }
@@ -120,6 +184,12 @@ func (s *YupooScraper) setupAlbumListingCollector() {
 			album.Title = strings.TrimSpace(e.Text)
 		}
 
+		// Filtrar álbumes no deseados (NBA, NFL)
+		titleUpper := strings.ToUpper(album.Title)
+		if strings.Contains(titleUpper, "NBA") || strings.Contains(titleUpper, "NFL") {
+			return // Ignorar este álbum
+		}
+
 		// Extraer el número de imágenes del texto del enlace
 		// El formato es: "número\ntítulo" o solo el número
 		text := strings.TrimSpace(e.Text)
@@ -143,11 +213,22 @@ func (s *YupooScraper) setupAlbumListingCollector() {
 			album.PageNumber = 1 // Primera página si no hay parámetro
 		}
 
+		// Asignar la categoría actual
+		album.Category = s.currentCategory
+
 		// Solo agregar si tiene datos válidos
 		if album.ID != "" && album.Title != "" {
-			s.albums = append(s.albums, album)
-			s.stats.SuccessfulScans++
-			log.Printf("  ✓ Álbum encontrado: %s (ID: %s, %d imágenes)\n", album.Title, album.ID, album.ImageCount)
+			s.mu.Lock()
+			// Verificar si ya alcanzamos el límite para esta categoría
+			if s.albumsInCategory < albumsPerCategory {
+				s.albums = append(s.albums, album)
+				s.stats.SuccessfulScans++
+				s.albumsInCategory++
+				s.mu.Unlock()
+				log.Printf("  ✓ Álbum encontrado: %s (ID: %s, %d imágenes)\n", album.Title, album.ID, album.ImageCount)
+			} else {
+				s.mu.Unlock()
+			}
 		}
 	})
 
@@ -169,25 +250,28 @@ func (s *YupooScraper) ScrapeAlbumImages(albumID string) ([]string, error) {
 
 	c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
-		Delay:       500 * time.Millisecond, // Reducido de 2s a 0.5s
+		Delay:       2 * time.Second, // Aumentado a 2s para evitar rate limiting
 	})
 
 	// Buscar las imágenes en el álbum
-	c.OnHTML("div.image__main img", func(e *colly.HTMLElement) {
+	// Las imágenes en Yupoo están con este patrón: img[src*="photo.yupoo.com"]
+	c.OnHTML("img[src*='photo.yupoo.com/huang-66']", func(e *colly.HTMLElement) {
 		if len(images) < imagesPerAlbum {
 			imgURL := e.Attr("src")
-			if imgURL != "" {
-				// Convertir a URL completa si es relativa
+			if imgURL != "" && !strings.Contains(imgURL, "logo") && !strings.Contains(imgURL, "icon") {
+				// Convertir a URL completa si es relativa (formato //photo.yupoo.com/...)
 				if strings.HasPrefix(imgURL, "//") {
 					imgURL = "https:" + imgURL
 				}
-				// Cambiar "small" por "medium" para mejor calidad
+				// Convertir de small a medium para mejor calidad
 				imgURL = strings.Replace(imgURL, "/small.jpg", "/medium.jpg", 1)
+				imgURL = strings.Replace(imgURL, "/small.jpeg", "/medium.jpeg", 1)
 				images = append(images, imgURL)
 			}
 		}
 	})
 
+	// Usar el formato correcto de URL: /albums/{albumID}?uid=1
 	url := fmt.Sprintf("%s/albums/%s?uid=1", baseURL, albumID)
 	err := c.Visit(url)
 	if err != nil {
@@ -209,25 +293,42 @@ func (s *YupooScraper) GetStats() models.ScraperStats {
 	return s.stats
 }
 
-// EnrichAlbumsWithImages obtiene las imágenes para cada álbum
+// EnrichAlbumsWithImages obtiene las imágenes para cada álbum usando concurrencia
 func (s *YupooScraper) EnrichAlbumsWithImages() error {
 	log.Println("\nObteniendo imágenes de cada álbum...")
 
+	// Usar workers paralelos para acelerar la descarga
+	const maxWorkers = 3 // Reducido de 20 a 3 para evitar rate limiting
+	semaphore := make(chan struct{}, maxWorkers)
+	var wg sync.WaitGroup
+	var mu sync.Mutex // Para proteger el contador de logs
+
 	for i := range s.albums {
-		log.Printf("  [%d/%d] Obteniendo imágenes del álbum: %s\n", i+1, len(s.albums), s.albums[i].Title)
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			semaphore <- struct{}{}        // Adquirir slot
+			defer func() { <-semaphore }() // Liberar slot
 
-		images, err := s.ScrapeAlbumImages(s.albums[i].ID)
-		if err != nil {
-			log.Printf("    ✗ Error: %v\n", err)
-			continue
-		}
+			mu.Lock()
+			log.Printf("  [%d/%d] Obteniendo imágenes del álbum: %s\n", index+1, len(s.albums), s.albums[index].Title)
+			mu.Unlock()
 
-		s.albums[i].Images = images
-		log.Printf("    ✓ %d imágenes obtenidas\n", len(images))
+			images, err := s.ScrapeAlbumImages(s.albums[index].ID)
+			if err != nil {
+				mu.Lock()
+				log.Printf("    ✗ Error: %v\n", err)
+				mu.Unlock()
+				return
+			}
 
-		// Pequeña pausa entre álbumes
-		time.Sleep(200 * time.Millisecond) // Reducido de 1s a 0.2s
+			s.albums[index].Images = images
+			mu.Lock()
+			log.Printf("    ✓ %d imágenes obtenidas\n", len(images))
+			mu.Unlock()
+		}(i)
 	}
 
+	wg.Wait()
 	return nil
 }
